@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { MapPin, Camera, LogIn, LogOut, X, ChevronRight, ShieldCheck, Clock, AlertTriangle, Plus, ArrowLeft, Navigation, Check, Loader2, Calendar, ChevronLeft, Download, BarChart3, List, Edit2 } from "lucide-react";
+import { MapPin, Camera, LogIn, LogOut, X, ChevronRight, ShieldCheck, Clock, AlertTriangle, Plus, ArrowLeft, Navigation, Check, Loader2, Calendar, ChevronLeft, Download, BarChart3, List, Edit2, Users, Trash2, Upload } from "lucide-react";
 import * as XLSX from "xlsx";
 import { storeGet, storeSet } from "./storage.js";
 
@@ -95,6 +95,13 @@ function fmtDist(m) {
 function fmtFecha(iso) {
   const d = new Date(iso);
   return d.toLocaleDateString("es-CO", { day: "2-digit", month: "short", year: "numeric" });
+}
+function fmtFechaExport(iso) {
+  const d = new Date(iso);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
 }
 function fmtHora(iso) {
   const d = new Date(iso);
@@ -263,8 +270,8 @@ function MiniMap({ markerA, markerB, labelA = "Marcación", labelB = "Punto" }) 
 // Redimensiona y comprime una imagen para que sea liviana sin perder
 // legibilidad en el panel admin. Apunta a un peso objetivo ajustando
 // la calidad JPEG de forma iterativa.
-const FOTO_MAX_ANCHO = 900; // px — suficiente para zoom moderado en el panel
-const FOTO_PESO_OBJETIVO_KB = 130;
+const FOTO_MAX_ANCHO = 1600; // px — buena calidad para zoom en el panel
+const FOTO_PESO_OBJETIVO_KB = 350;
 
 function comprimirFoto(video, canvas) {
   const escala = Math.min(1, FOTO_MAX_ANCHO / video.videoWidth);
@@ -275,12 +282,12 @@ function comprimirFoto(video, canvas) {
 
   const nitidez = medirNitidez(ctx, canvas.width, canvas.height);
 
-  let calidad = 0.8;
+  let calidad = 0.88;
   let dataUrl = canvas.toDataURL("image/jpeg", calidad);
   let pesoKB = Math.round((dataUrl.length * 0.75) / 1024); // base64 ≈ 1.33x el binario
 
   // Si sigue pesando más de lo deseado, bajar calidad en pasos hasta un mínimo razonable
-  while (pesoKB > FOTO_PESO_OBJETIVO_KB && calidad > 0.35) {
+  while (pesoKB > FOTO_PESO_OBJETIVO_KB && calidad > 0.50) {
     calidad -= 0.1;
     dataUrl = canvas.toDataURL("image/jpeg", calidad);
     pesoKB = Math.round((dataUrl.length * 0.75) / 1024);
@@ -346,7 +353,7 @@ function CameraCapture({ onCapture, onCancel }) {
   useEffect(() => {
     let mounted = true;
     navigator.mediaDevices
-      ?.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+      ?.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
       .then((stream) => {
         if (!mounted) return;
         streamRef.current = stream;
@@ -1448,7 +1455,7 @@ function exportarExcel(registros, mensajeros, puntos, turnos, asignaciones, desd
         "Ciudad": mj?.ciudad || "",
         "Turno del día": horario?.turnoNombre || (horario ? "Horario base" : ""),
         "Tipo": r.tipo === "entrada" ? "Entrada" : "Salida",
-        "Fecha": fmtFecha(r.timestamp),
+        "Fecha": fmtFechaExport(r.timestamp),
         "Hora": fmtHora(r.timestamp),
         "Punto": p ? `${p.codigo} - ${p.nombre}` : "",
         "Latitud marcada": r.lat,
@@ -1822,6 +1829,265 @@ function GestorTurnos({ mensajeros, turnos, asignaciones, onAddTurno, onAsignar,
 }
 
 
+// ---------- Gestor de conductores (crear manual y masivo) ----------
+function GestorConductores({ mensajeros, onAddConductor, onDeleteConductor, onImportarConductores }) {
+  const [subtab, setSubtab] = useState("lista"); // lista | manual | masiva
+  const [nombre, setNombre] = useState("");
+  const [placa, setPlaca] = useState("");
+  const [ciudad, setCiudad] = useState(CIUDADES[0]);
+  const [horaEntrada, setHoraEntrada] = useState("08:00");
+  const [horaSalida, setHoraSalida] = useState("18:00");
+  const [error, setError] = useState("");
+  const [exito, setExito] = useState("");
+  const [busqueda, setBusqueda] = useState("");
+  const [ciudadFiltro, setCiudadFiltro] = useState("todas");
+
+  // ── Manual ──
+  function crearManual() {
+    const nombreLimpio = nombre.trim();
+    const placaLimpia = placa.trim().toUpperCase();
+    if (!nombreLimpio) { setError("El nombre es obligatorio."); return; }
+    if (!placaLimpia) { setError("La placa es obligatoria."); return; }
+    if (mensajeros.some((m) => m.nombre.toLowerCase() === nombreLimpio.toLowerCase())) {
+      setError(`Ya existe un conductor con el nombre "${nombreLimpio}".`);
+      return;
+    }
+    setError("");
+    onAddConductor({ nombre: nombreLimpio, placa: placaLimpia, ciudad, horaEntrada, horaSalida });
+    setNombre(""); setPlaca("");
+    setExito(`${nombreLimpio} creado correctamente.`);
+    setTimeout(() => setExito(""), 3000);
+  }
+
+  // ── Masiva ──
+  const fileRef = useRef(null);
+  const [procesando, setProcesando] = useState(false);
+  const [resultadoCarga, setResultadoCarga] = useState(null);
+
+  function plantillaConductores() {
+    const filas = [
+      { nombre: "Juan Pérez", placa: "ABC123", ciudad: "Bogotá", horaEntrada: "08:00", horaSalida: "18:00" },
+      { nombre: "María López", placa: "XYZ789", ciudad: "Medellín", horaEntrada: "07:30", horaSalida: "17:30" },
+    ];
+    const ws = XLSX.utils.json_to_sheet(filas);
+    ws["!cols"] = [{ wch: 22 }, { wch: 10 }, { wch: 14 }, { wch: 12 }, { wch: 12 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Conductores");
+    XLSX.writeFile(wb, "plantilla_conductores_nvo.xlsx");
+  }
+
+  function procesarArchivoConductores(file) {
+    setProcesando(true);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "binary" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const filas = XLSX.utils.sheet_to_json(ws, { raw: false });
+
+        const validas = [];
+        const errores = [];
+        const nombresExistentes = new Set(mensajeros.map((m) => m.nombre.toLowerCase()));
+
+        filas.forEach((fila, idx) => {
+          const n = String(fila.nombre || fila.Nombre || "").trim();
+          const p = String(fila.placa || fila.Placa || "").trim().toUpperCase();
+          const c = String(fila.ciudad || fila.Ciudad || "").trim();
+          const he = String(fila.horaEntrada || fila["Hora Entrada"] || fila.hora_entrada || "08:00").trim();
+          const hs = String(fila.horaSalida || fila["Hora Salida"] || fila.hora_salida || "18:00").trim();
+
+          if (!n) { errores.push({ fila: idx + 2, motivo: "Nombre vacío" }); return; }
+          if (!p) { errores.push({ fila: idx + 2, motivo: `Placa vacía para "${n}"` }); return; }
+          if (!c) { errores.push({ fila: idx + 2, motivo: `Ciudad vacía para "${n}"` }); return; }
+          if (!CIUDADES.includes(c)) { errores.push({ fila: idx + 2, motivo: `Ciudad "${c}" no válida para "${n}"` }); return; }
+          if (nombresExistentes.has(n.toLowerCase())) { errores.push({ fila: idx + 2, motivo: `"${n}" ya existe` }); return; }
+
+          nombresExistentes.add(n.toLowerCase());
+          validas.push({ nombre: n, placa: p, ciudad: c, horaEntrada: he, horaSalida: hs });
+        });
+
+        if (validas.length > 0) onImportarConductores(validas);
+        setResultadoCarga({ ok: validas.length, errores, total: filas.length });
+      } catch (err) {
+        setResultadoCarga({ ok: 0, errores: [{ fila: "-", motivo: "No se pudo leer el archivo." }], total: 0 });
+      }
+      setProcesando(false);
+    };
+    reader.readAsBinaryString(file);
+  }
+
+  // ── Lista filtrada ──
+  const ciudadesConGente = CIUDADES.filter((c) => mensajeros.some((m) => m.ciudad === c));
+  const filtrados = mensajeros
+    .filter((m) => ciudadFiltro === "todas" || m.ciudad === ciudadFiltro)
+    .filter((m) => m.nombre.toLowerCase().includes(busqueda.toLowerCase()) || (m.placa || "").toLowerCase().includes(busqueda.toLowerCase()))
+    .sort((a, b) => a.nombre.localeCompare(b.nombre));
+
+  return (
+    <div className="nvo-turnos-wrap" style={{ padding: 18 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+        {[["lista", "Conductores"], ["manual", "Crear manual"], ["masiva", "Carga masiva"]].map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setSubtab(k)}
+            style={{
+              flex: 1, padding: "8px 6px", borderRadius: 8, fontSize: 11.5, fontWeight: 700,
+              border: subtab === k ? "1px solid var(--ink)" : "1px solid var(--line)",
+              background: subtab === k ? "var(--ink)" : "var(--paper)",
+              color: subtab === k ? "var(--paper)" : "var(--muted)",
+              cursor: "pointer",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── LISTA ── */}
+      {subtab === "lista" && (
+        <div>
+          <input
+            placeholder="Buscar por nombre o placa…"
+            value={busqueda}
+            onChange={(e) => setBusqueda(e.target.value)}
+            style={{ ...inputStyle(), width: "100%", marginBottom: 10 }}
+          />
+          {ciudadesConGente.length > 1 && (
+            <div style={{ display: "flex", gap: 6, marginBottom: 12, overflowX: "auto", paddingBottom: 2 }}>
+              <button onClick={() => setCiudadFiltro("todas")} style={chipFiltroStyle(ciudadFiltro === "todas")}>Todas</button>
+              {ciudadesConGente.map((c) => (
+                <button key={c} onClick={() => setCiudadFiltro(c)} style={chipFiltroStyle(ciudadFiltro === c)}>{c}</button>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>
+            {filtrados.length} conductor{filtrados.length !== 1 ? "es" : ""}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 400, overflowY: "auto" }}>
+            {filtrados.length === 0 && <div style={{ fontSize: 13, color: "var(--muted)" }}>Sin resultados.</div>}
+            {filtrados.map((mj) => (
+              <div key={mj.nombre} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", border: "1px solid var(--line)", borderRadius: 10, background: "var(--paper)" }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "var(--ink)" }}>{mj.nombre}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                    {mj.placa ? `${mj.placa} · ` : ""}{mj.ciudad} · {mj.horaEntrada}–{mj.horaSalida}
+                  </div>
+                </div>
+                <button
+                  onClick={() => { if (window.confirm(`¿Eliminar a ${mj.nombre}?`)) onDeleteConductor(mj.nombre); }}
+                  style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", display: "flex", padding: 4 }}
+                  title="Eliminar conductor"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── MANUAL ── */}
+      {subtab === "manual" && (
+        <div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Nombre completo *</label>
+              <input placeholder="Ej. Carlos Ramírez" value={nombre} onChange={(e) => setNombre(e.target.value)} style={{ ...inputStyle(), width: "100%", marginTop: 4 }} />
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Placa *</label>
+                <input placeholder="ABC123" value={placa} onChange={(e) => setPlaca(e.target.value.toUpperCase())} style={{ ...inputStyle(), width: "100%", marginTop: 4, fontFamily: "monospace" }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Ciudad *</label>
+                <select value={ciudad} onChange={(e) => setCiudad(e.target.value)} style={{ ...inputStyle(), width: "100%", marginTop: 4 }}>
+                  {CIUDADES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Hora entrada</label>
+                <input type="time" value={horaEntrada} onChange={(e) => setHoraEntrada(e.target.value)} style={{ ...inputStyle(), width: "100%", marginTop: 4 }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Hora salida</label>
+                <input type="time" value={horaSalida} onChange={(e) => setHoraSalida(e.target.value)} style={{ ...inputStyle(), width: "100%", marginTop: 4 }} />
+              </div>
+            </div>
+            {error && (
+              <div style={{ fontSize: 12, color: "var(--accent)", display: "flex", alignItems: "center", gap: 6 }}>
+                <AlertTriangle size={13} /> {error}
+              </div>
+            )}
+            {exito && (
+              <div style={{ fontSize: 12, color: "var(--ok)", display: "flex", alignItems: "center", gap: 6 }}>
+                <Check size={13} /> {exito}
+              </div>
+            )}
+            <button
+              onClick={crearManual}
+              style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: "var(--accent)", color: "white", border: "none", borderRadius: 8, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginTop: 4 }}
+            >
+              <Plus size={15} /> Crear conductor
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── MASIVA ── */}
+      {subtab === "masiva" && (
+        <div>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
+            Sube un archivo Excel o CSV con las columnas <b>nombre</b>, <b>placa</b> y <b>ciudad</b>.
+            Opcionalmente puedes incluir <b>horaEntrada</b> y <b>horaSalida</b> (por defecto 08:00–18:00).
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>
+            <b>Ciudades válidas:</b> {CIUDADES.join(", ")}
+          </div>
+          <button onClick={plantillaConductores} style={{ display: "flex", alignItems: "center", gap: 6, background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 14px", fontSize: 12, fontWeight: 700, color: "var(--ink)", cursor: "pointer", marginBottom: 14 }}>
+            <Download size={13} /> Descargar plantilla
+          </button>
+
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            style={{ display: "none" }}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) procesarArchivoConductores(f); }}
+          />
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={procesando}
+            style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: "var(--accent)", color: "white", border: "none", borderRadius: 8, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          >
+            {procesando ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
+            {procesando ? "Procesando…" : "Subir archivo de conductores"}
+          </button>
+
+          {resultadoCarga && (
+            <div style={{ marginTop: 14, border: "1px solid var(--line)", borderRadius: 10, padding: 12, background: "var(--bg)" }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: resultadoCarga.ok > 0 ? "var(--ok)" : "var(--accent)", marginBottom: 4 }}>
+                {resultadoCarga.ok} de {resultadoCarga.total} conductores importados
+              </div>
+              {resultadoCarga.errores.length > 0 && (
+                <div style={{ fontSize: 12, color: "var(--accent)" }}>
+                  {resultadoCarga.errores.slice(0, 8).map((er, i) => (
+                    <div key={i}>Fila {er.fila}: {er.motivo}</div>
+                  ))}
+                  {resultadoCarga.errores.length > 8 && <div>… y {resultadoCarga.errores.length - 8} error(es) más.</div>}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ---------- Combo buscable (para listas largas de mensajeros) ----------
 function ComboBuscable({ mensajeros, valor, onChange, placeholder = "Todos los mensajeros", etiquetaTodos }) {
   const [abierto, setAbierto] = useState(false);
@@ -1960,7 +2226,7 @@ function ComboBuscableTienda({ puntos, valor, onChange }) {
 }
 
 // ---------- Vista: panel administrador ----------
-function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAddPunto, onUpdateMensajero, onAddTurno, onAsignarTurno, onQuitarAsignacion, onImportarMasivo, onBack }) {
+function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAddPunto, onUpdateMensajero, onAddConductor, onDeleteConductor, onImportarConductores, onAddTurno, onAsignarTurno, onQuitarAsignacion, onImportarMasivo, onBack }) {
   const [tab, setTab] = useState("bitacora"); // bitacora | dashboard | equipo | turnos
   const [fechaSeleccionada, setFechaSeleccionada] = useState(new Date());
   const [filtroMensajero, setFiltroMensajero] = useState("todos");
@@ -1971,6 +2237,8 @@ function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAdd
   const [showNuevoPunto, setShowNuevoPunto] = useState(false);
   const [showExportar, setShowExportar] = useState(false);
   const [editandoHorario, setEditandoHorario] = useState(null);
+  const [ampliarFoto, setAmpliarFoto] = useState(false);
+  const [ampliarMapa, setAmpliarMapa] = useState(false);
   const [busquedaEquipo, setBusquedaEquipo] = useState("");
   const [ciudadEquipo, setCiudadEquipo] = useState("todas");
   const [nuevoPunto, setNuevoPunto] = useState({ codigo: "", nombre: "", ciudad: CIUDADES[0], coordenadas: "", direccion: "" });
@@ -2086,6 +2354,17 @@ function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAdd
         >
           <Clock size={14} /> Horarios
         </button>
+        <button
+          onClick={() => setTab("conductores")}
+          style={{
+            flex: "1 0 auto", minWidth: 90, padding: "12px 8px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", border: "none",
+            background: "transparent", color: tab === "conductores" ? "var(--ink)" : "var(--muted)",
+            borderBottom: tab === "conductores" ? "2px solid var(--accent)" : "2px solid transparent",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
+          }}
+        >
+          <Users size={14} /> Conductores
+        </button>
       </div>
 
       {tab === "dashboard" && (
@@ -2177,6 +2456,15 @@ function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAdd
         </div>
       )}
 
+      {tab === "conductores" && (
+        <GestorConductores
+          mensajeros={mensajeros}
+          onAddConductor={onAddConductor}
+          onDeleteConductor={onDeleteConductor}
+          onImportarConductores={onImportarConductores}
+        />
+      )}
+
       {tab === "bitacora" && (
         <>
           <div className="nvo-filtros-bitacora">
@@ -2238,7 +2526,7 @@ function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAdd
                   return (
                     <button
                       key={r.id}
-                      onClick={() => setSeleccion(r)}
+                      onClick={() => { setSeleccion(r); setAmpliarFoto(false); setAmpliarMapa(false); }}
                       style={{
                         textAlign: "left",
                         display: "flex",
@@ -2315,16 +2603,69 @@ function PanelAdmin({ puntos, registros, mensajeros, turnos, asignaciones, onAdd
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
-                  <img src={activo.foto} alt="evidencia" style={{ width: "100%", height: 140, objectFit: "cover", borderRadius: 10, border: "1px solid var(--line)" }} />
-                  <div style={{ border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden" }}>
+                  <div
+                    onClick={() => setAmpliarFoto(true)}
+                    style={{ cursor: "pointer", position: "relative", borderRadius: 10, overflow: "hidden", border: "1px solid var(--line)" }}
+                    title="Clic para ampliar"
+                  >
+                    <img src={activo.foto} alt="evidencia" style={{ width: "100%", height: 180, objectFit: "cover", display: "block" }} />
+                    <div style={{ position: "absolute", bottom: 6, right: 6, background: "rgba(0,0,0,0.55)", color: "white", fontSize: 10, padding: "3px 8px", borderRadius: 12, fontWeight: 600 }}>
+                      Ampliar
+                    </div>
+                  </div>
+                  <div
+                    onClick={() => setAmpliarMapa(true)}
+                    style={{ border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden", cursor: "pointer", position: "relative" }}
+                    title="Clic para ampliar"
+                  >
                     <MiniMap
                       markerA={{ lat: activo.lat, lng: activo.lng }}
                       markerB={puntoActivo ? { lat: puntoActivo.lat, lng: puntoActivo.lng } : null}
                       labelA="Marcó aquí"
                       labelB={puntoActivo ? puntoActivo.codigo : "Punto"}
                     />
+                    <div style={{ position: "absolute", bottom: 6, right: 6, background: "rgba(0,0,0,0.55)", color: "white", fontSize: 10, padding: "3px 8px", borderRadius: 12, fontWeight: 600 }}>
+                      Ampliar
+                    </div>
                   </div>
                 </div>
+
+                {ampliarFoto && (
+                  <ModalAmpliar onClose={() => setAmpliarFoto(false)} titulo="Evidencia fotográfica">
+                    <img src={activo.foto} alt="evidencia ampliada" style={{ maxWidth: "95vw", maxHeight: "75vh", objectFit: "contain", borderRadius: 8 }} />
+                  </ModalAmpliar>
+                )}
+                {ampliarMapa && (
+                  <ModalAmpliar onClose={() => setAmpliarMapa(false)} titulo={`Ubicación — ${activo.mensajero}`}>
+                    <div style={{ width: "min(95vw, 700px)", background: "var(--paper)", borderRadius: 12, overflow: "hidden", padding: 12 }}>
+                      <MiniMap
+                        markerA={{ lat: activo.lat, lng: activo.lng }}
+                        markerB={puntoActivo ? { lat: puntoActivo.lat, lng: puntoActivo.lng } : null}
+                        labelA="Marcó aquí"
+                        labelB={puntoActivo ? puntoActivo.codigo : "Punto"}
+                      />
+                      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, fontSize: 12, color: "var(--ink)" }}>
+                        <div><strong>Marcación:</strong> {activo.lat.toFixed(6)}, {activo.lng.toFixed(6)}</div>
+                        {puntoActivo && <div><strong>Punto:</strong> {puntoActivo.lat.toFixed(6)}, {puntoActivo.lng.toFixed(6)}</div>}
+                      </div>
+                      {distancia != null && (
+                        <div style={{ textAlign: "center", marginTop: 8, fontSize: 13, fontWeight: 700, color: distancia > UMBRAL ? "var(--accent)" : "var(--ok)" }}>
+                          Distancia: {fmtDist(distancia)} {distancia > UMBRAL ? "⚠ Fuera de zona" : "✓ En zona"}
+                        </div>
+                      )}
+                      {puntoActivo && (
+                        <a
+                          href={`https://www.google.com/maps/dir/${activo.lat},${activo.lng}/${puntoActivo.lat},${puntoActivo.lng}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ display: "block", textAlign: "center", marginTop: 10, fontSize: 12, color: "var(--accent)", fontWeight: 700 }}
+                        >
+                          Ver en Google Maps ↗
+                        </a>
+                      )}
+                    </div>
+                  </ModalAmpliar>
+                )}
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 12 }}>
                   <div style={{ background: "var(--bg)", borderRadius: 8, padding: 10 }}>
@@ -2476,6 +2817,30 @@ export default function App() {
     });
   }, []);
 
+  const addConductor = useCallback(async (conductor) => {
+    setMensajeros((prev) => {
+      const next = [...prev, conductor];
+      storeSet("mensajeros", JSON.stringify(next), true);
+      return next;
+    });
+  }, []);
+
+  const deleteConductor = useCallback(async (nombre) => {
+    setMensajeros((prev) => {
+      const next = prev.filter((m) => m.nombre !== nombre);
+      storeSet("mensajeros", JSON.stringify(next), true);
+      return next;
+    });
+  }, []);
+
+  const importarConductores = useCallback(async (lista) => {
+    setMensajeros((prev) => {
+      const next = [...prev, ...lista];
+      storeSet("mensajeros", JSON.stringify(next), true);
+      return next;
+    });
+  }, []);
+
   const addTurno = useCallback(async (turno) => {
     setTurnos((prev) => {
       const next = [...prev, turno];
@@ -2610,6 +2975,9 @@ export default function App() {
           asignaciones={asignaciones}
           onAddPunto={addPunto}
           onUpdateMensajero={updateMensajero}
+          onAddConductor={addConductor}
+          onDeleteConductor={deleteConductor}
+          onImportarConductores={importarConductores}
           onAddTurno={addTurno}
           onAsignarTurno={asignarTurno}
           onQuitarAsignacion={quitarAsignacion}
@@ -2625,6 +2993,40 @@ export default function App() {
         </div>
       )}
     </Shell>
+  );
+}
+
+// ---------- Modal ampliar: foto o mapa a pantalla completa ----------
+function ModalAmpliar({ children, onClose, titulo }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", zIndex: 95,
+        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+        padding: 16, cursor: "pointer",
+      }}
+    >
+      <div style={{ color: "white", fontSize: 13, fontWeight: 700, marginBottom: 10, fontFamily: "var(--font-display)", letterSpacing: "0.05em" }}>
+        {titulo || ""} <span style={{ fontWeight: 400, fontSize: 11 }}>· toca para cerrar</span>
+      </div>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: "95vw", maxHeight: "80vh", display: "flex", alignItems: "center", justifyContent: "center", cursor: "default" }}
+      >
+        {children}
+      </div>
+      <button
+        onClick={onClose}
+        style={{
+          marginTop: 16, background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.3)",
+          borderRadius: 10, padding: "10px 28px", color: "white", fontSize: 14, fontWeight: 700,
+          fontFamily: "var(--font-body)", cursor: "pointer",
+        }}
+      >
+        Cerrar
+      </button>
+    </div>
   );
 }
 
@@ -2662,13 +3064,21 @@ function Shell({ children, wide }) {
         .spin { animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* En pantallas anchas (PC/tablet), el panel admin usa más espacio horizontal */
+        /* ── MÓVIL: admin panel optimizado ── */
+        @media (max-width: 899px) {
+          .nvo-shell-wide { max-width: 100% !important; }
+          .nvo-admin-list-col { max-height: 45vh !important; overflow-y: auto !important; }
+          .nvo-admin-detail-col { max-height: none !important; padding-bottom: 24px !important; }
+          .nvo-metric-grid { grid-template-columns: 1fr 1fr !important; }
+        }
+
+        /* ── PC/TABLET: el panel admin usa espacio horizontal completo ── */
         @media (min-width: 900px) {
-          .nvo-shell-wide { max-width: 1080px !important; }
-          .nvo-admin-cols { display: grid !important; grid-template-columns: 380px 1fr !important; gap: 0 !important; align-items: stretch; }
+          .nvo-shell-wide { max-width: 1200px !important; }
+          .nvo-admin-cols { display: grid !important; grid-template-columns: 400px 1fr !important; gap: 0 !important; align-items: stretch; }
           .nvo-admin-cols > div { max-height: none !important; }
-          .nvo-admin-list-col { border-right: 1px solid var(--line); overflow-y: auto !important; max-height: calc(100vh - 230px) !important; }
-          .nvo-admin-detail-col { overflow-y: auto !important; max-height: calc(100vh - 230px) !important; border-top: none !important; }
+          .nvo-admin-list-col { border-right: 1px solid var(--line); overflow-y: auto !important; max-height: calc(100vh - 180px) !important; }
+          .nvo-admin-detail-col { overflow-y: auto !important; max-height: calc(100vh - 180px) !important; border-top: none !important; }
           .nvo-metric-grid { grid-template-columns: repeat(4, 1fr) !important; }
           .nvo-calendar-row { max-width: 360px; }
 
@@ -2678,11 +3088,17 @@ function Shell({ children, wide }) {
           .nvo-filtros-bitacora > div:first-child { flex: 1.1; }
 
           /* Turnos: contenido no se estira a todo el ancho */
-          .nvo-turnos-wrap { max-width: 480px; margin: 0 auto; }
+          .nvo-turnos-wrap { max-width: 520px; margin: 0 auto; }
 
           /* Horarios: tarjetas en grilla de 2 columnas */
           .nvo-horarios-grid { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 10px !important; align-items: start; }
           .nvo-horario-card { grid-column: span 1; }
+        }
+
+        /* ── PANTALLA GRANDE (>1200px): aún más espacio ── */
+        @media (min-width: 1200px) {
+          .nvo-shell-wide { max-width: 1400px !important; }
+          .nvo-admin-cols { grid-template-columns: 450px 1fr !important; }
         }
       `}</style>
       {children}
